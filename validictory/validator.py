@@ -57,12 +57,15 @@ validate_format_time = _generate_datetime_validator('time', '%H:%M:%S')
 
 def validate_format_utc_millisec(validator, fieldname, value, format_option):
     if not isinstance(value, _int_types + (float, Decimal)):
-        raise FieldValidationError("Value %(value)r of field '%(fieldname)s' is "
-                              "not a number" % locals(), fieldname, value)
+        message = "Value {0} of field '{1}'' is not a number".format(fieldname,
+                                                                     value)
+        raise FieldValidationError(message)
 
     if not value > 0:
-        raise FieldValidationError("Value %(value)r of field '%(fieldname)s' is "
-                              "not a positive number" % locals(), fieldname, value)
+        message = "Value {0} of field '{1}' is not a positive "
+        "number".format(fieldname, value)
+
+        raise FieldValidationError(message)
 
 
 def validate_format_ip_address(validator, fieldname, value, format_option):
@@ -74,8 +77,10 @@ def validate_format_ip_address(validator, fieldname, value, format_option):
     except:
         ip = False
     if not ip:
-        raise FieldValidationError("Value %(value)r of field '%(fieldname)s' is "
-                              "not a ip-address" % locals(), fieldname, value)
+        message = "Value {0} of field '{1}' is not a "
+        "ip-address".format(fieldname, value)
+
+        raise FieldValidationError(message)
 
 
 DEFAULT_FORMAT_VALIDATORS = {
@@ -84,6 +89,9 @@ DEFAULT_FORMAT_VALIDATORS = {
     'time': validate_format_time,
     'utc-millisec': validate_format_utc_millisec,
     'ip-address': validate_format_ip_address,
+}
+
+DEFAULT_PREPROCESS_REFORMATORS = {
 }
 
 
@@ -102,17 +110,26 @@ class SchemaValidator(object):
     '''
 
     def __init__(self, format_validators=None, required_by_default=True,
-                 blank_by_default=False, disallow_unknown_properties=False):
+                 blank_by_default=False, disallow_unknown_properties=False,
+                 preprocess_reformators=None):
+
         if format_validators is None:
             format_validators = DEFAULT_FORMAT_VALIDATORS.copy()
-
         self._format_validators = format_validators
+
+        if preprocess_reformators is None:
+            preprocess_reformators = DEFAULT_PREPROCESS_REFORMATORS.copy()
+        self._preprocess_reformators = preprocess_reformators
+
         self.required_by_default = required_by_default
         self.blank_by_default = blank_by_default
         self.disallow_unknown_properties = disallow_unknown_properties
 
     def register_format_validator(self, format_name, format_validator_fun):
         self._format_validators[format_name] = format_validator_fun
+
+    def preprocess_reformat_test(self, val):
+        return u'{0} ham'.format(val)
 
     def validate_type_string(self, val):
         return isinstance(val, _str_type)
@@ -173,6 +190,23 @@ class SchemaValidator(object):
 
         if fieldtype and fieldexists:
             if isinstance(fieldtype, (list, tuple)):
+
+                # If values is missing
+                if len(items) != len(value):
+
+                    # resolve defaults now
+                    for i, item in enumerate(items):
+                        try:
+                            value[i]
+                        except IndexError as e:
+                            # obviously it does not exists
+                            if 'default' in item:
+                                value.append(item['default'])
+                            else:
+                                message = u"Failed to validate field {0} value"
+                                " missing for item {1}".format(fieldname, i)
+                                raise ValidationError(message)
+
                 # Match if type matches any one of the types in the list
                 datavalid = False
                 for eachtype in fieldtype:
@@ -245,9 +279,9 @@ class SchemaValidator(object):
                                 self.validate(value[itemIndex],
                                               items[itemIndex])
                             except FieldValidationError as e:
-                                raise type(e)("Failed to validate field '%s' "
-                                              "list schema: %s" %
-                                              (fieldname, e), fieldname, e.value)
+                                m = "Failed to validate field {0} list schema:"
+                                "{1}".format(fieldname, e)
+                                raise type(e)(m)
                 elif isinstance(items, dict):
                     for eachItem in value:
                         if self.disallow_unknown_properties:
@@ -261,9 +295,9 @@ class SchemaValidator(object):
                             # with 'list item' so error messages make sense
                             old_error = str(e).replace("field '_data'",
                                                        'list item')
-                            raise type(e)("Failed to validate field '%s' list "
-                                          "schema: %s" %
-                                          (fieldname, old_error), fieldname, e.value)
+                            m = "Failed to validate field '%s' list schema: %s"
+                            "" % (fieldname, old_error), fieldname, e.value
+                            raise type(e)(m)
                 else:
                     raise SchemaError("Properties definition of field '%s' is "
                                       "not a list or an object" % fieldname)
@@ -443,6 +477,20 @@ class SchemaValidator(object):
     validate_minItems = validate_minLength
     validate_maxItems = validate_maxLength
 
+    def preprocess_reformat(self, x, fieldname, schema, reformat_option=None):
+        '''
+        preprocessing, reformats value.
+        '''
+        value = x.get(fieldname)
+        ps = self._preprocess_reformators
+        p_r = ps.get(reformat_option, None)
+
+        if p_r and value:
+            value = p_r(self, fieldname, value, reformat_option)
+            x.update({fieldname: value})
+
+        return x
+
     def validate_format(self, x, fieldname, schema, format_option=None):
         '''
         Validates the format of primitive data types
@@ -556,10 +604,10 @@ class SchemaValidator(object):
         '''
         Validates a piece of json data against the provided json-schema.
         '''
-        self._validate(data, schema)
+        return self._validate(data, schema)
 
     def _validate(self, data, schema):
-        self.__validate("_data", {"_data": data}, schema)
+        return self.__validate("_data", {"_data": data}, schema).get('_data')
 
     def __validate(self, fieldname, data, schema):
 
@@ -570,6 +618,9 @@ class SchemaValidator(object):
                     (fieldname, type(schema).__name__))
 
             newschema = copy.copy(schema)
+
+            if fieldname not in data and 'default' in schema:
+                data[fieldname] = schema['default']
 
             if 'optional' in schema:
                 raise SchemaError('The "optional" attribute has been replaced'
@@ -585,6 +636,15 @@ class SchemaValidator(object):
 
             for schemaprop in newschema:
 
+                # Preprocess
+                preprocessname = "preprocess_" + schemaprop
+
+                preprocessor = getattr(self, preprocessname, None)
+                if preprocessor:
+                    data = preprocessor(data, fieldname, schema,
+                                        newschema.get(schemaprop))
+
+                # Validate
                 validatorname = "validate_" + schemaprop
 
                 validator = getattr(self, validatorname, None)
@@ -593,5 +653,6 @@ class SchemaValidator(object):
                               newschema.get(schemaprop))
 
         return data
+
 
 __all__ = ['SchemaValidator', 'FieldValidationError']
